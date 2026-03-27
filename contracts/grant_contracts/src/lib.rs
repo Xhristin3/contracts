@@ -2,20 +2,17 @@
 #![no_std]
 
 use core::cmp::min;
-
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Map, String,
-    Symbol, Vec,
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, 
+    token, Address, Env, Map, String, Symbol, Vec, vec, IntoVal,
 };
 
+// Import custom modules
 use crate::wasm_hash_verification::{WasmHashVerification, VerificationError};
 use crate::cross_chain_metadata::{CrossChainMetadata, MetadataError};
 
 // --- Constants ---
-pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+pub const SCALING_FACTOR: i128 = 10_000_000; 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 const NFT_SUPPLY: i128 = 1000000; // Max NFT supply for completion certificates
@@ -88,12 +85,16 @@ const MAX_FLASH_LOAN_AMOUNT: i128 = 10_000_000_000; // Maximum 1000 XLM flash lo
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
-pub mod atomic_bridge;
+pub mod temporal_guard;
+pub mod stream_nft;
+pub mod multi_token_matching;
+pub mod staking_multiplier;
 pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod temporal_guard;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -110,6 +111,8 @@ mod test_optimistic_milestones;
 mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
+#[cfg(test)]
+mod test_stream_nft;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -146,8 +149,7 @@ fn require_admin_auth(env: &Env) -> Result<(), Error> {
     Ok(())
 }
 
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage().instance().get(&DataKey::GrantIds).unwrap_or_else(|| Vec::new(env))
+    max_id + 1
 }
 /// Advanced batch initialization with multi-asset support and deposit verification
 ///
@@ -364,88 +366,7 @@ pub struct Grant {
         current_grant_id += 1;
     }
 
-    // Update grant IDs list
-    env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
-
-    let result = BatchInitResult {
-        successful_grants: successful_grants.clone(),
-        failed_grants,
-        total_deposited,
-        grants_created: successful_grants.len(),
-    };
-
-    // Emit detailed batch creation event
-    env.events().publish(
-        (symbol_short!("batch_adv"),),
-        (
-            result.grants_created,
-            result.total_deposited,
-            start_id,
-            asset_requirements.len(),
-        ),
-    );
-
-    Ok(result)
-}
-
-/// Task #192: Batch refund for failed grant rounds
-/// Iterates through all DonorRecords and returns their contributions in a single atomic transaction.
-/// Optimized via bulk state fetching if possible, but for Soroban we iterate through stored donor list.
-pub fn batch_refund(env: Env, grant_id: u64) -> Result<(), Error> {
-    require_admin_auth(&env)?;
-    
-    // Check if grant exists and is cancelled or otherwise failed
-    let grant_key = DataKey::Grant(grant_id);
-    let mut grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
-
-    if !has_status_mask(grant.status, GrantStatus::Cancelled) {
-        return Err(Error::InvalidState);
-    }
-
-    // Get list of donors
-    let donors: Vec<Address> = env.storage().instance().get(&DataKey::GrantDonors(grant_id)).unwrap_or_else(|| Vec::new(&env));
-    
-    if donors.is_empty() {
-        return Ok(());
-    }
-
-    let token_client = token::Client::new(&env, &grant.token_address);
-    let mut total_refunded = 0i128;
-
-    // Process refunds atomically
-    // Note: If donors list is very large (e.g. > 100), this might hit gas limits.
-    // In production, consider a multi-stage refund process if donors > 50.
-    for donor in donors.iter() {
-        let record_key = DataKey::DonorRecord(grant_id, donor.clone());
-        let amount: i128 = env.storage().instance().get(&record_key).unwrap_or(0);
-        
-        if amount > 0 {
-            // Transfer back to donor
-            token_client.transfer(&env.current_contract_address(), &donor, &amount);
-            
-            // Clear record to prevent double refund
-            env.storage().instance().remove(&record_key);
-            total_refunded = total_refunded.checked_add(amount).ok_or(Error::MathOverflow)?;
-        }
-    }
-
-    // Clear donor list
-    env.storage().instance().remove(&DataKey::GrantDonors(grant_id));
-
-    env.events().publish(
-        (symbol_short!("batchref"), grant_id),
-        (donors.len(), total_refunded),
-    );
-
-    Ok(())
-}
-
-/// Helper function to check status (assuming GrantStatus has bitflags or similar)
-fn has_status_mask(current_status: GrantStatus, target: GrantStatus) -> bool {
-    current_status == target
-}
-
-// --- Types ---
+// --- Enums ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -455,11 +376,14 @@ pub enum GrantStatus {
     Completed,
     RageQuitted,
     Cancelled,
-    // Milestone-related statuses
-    MilestoneClaimed,    // Milestone claimed, in challenge period
-    MilestoneApproved,    // Challenge period passed, funds released
-    MilestoneChallenged,  // Milestone challenged, under review
-    MilestoneRejected,    // Challenge successful, claim rejected
+    Slashed,
+    MilestoneClaimed,
+    MilestoneApproved,
+    MilestoneChallenged,
+    MilestoneRejected,
+    DisputeRaised,
+    ArbitrationPending,
+    ArbitrationResolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,11 +548,6 @@ pub struct Grant {
     // Gas buffer fields for fail-safe withdrawals
     pub gas_buffer: i128, // Pre-paid XLM buffer for high network fee periods
     pub gas_buffer_used: i128, // Amount of gas buffer used so far
-
-    // Task #193: Withdrawal limits
-    pub max_withdrawal_per_day: i128,
-    pub last_withdrawal_timestamp: u64,
-    pub withdrawal_amount_today: i128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,26 +572,6 @@ pub struct GranteeConfig {
     pub milestone_amount: i128,     // Amount per milestone
     pub total_milestones: u32,     // Total number of milestones
     pub gas_buffer: i128,          // Pre-paid XLM buffer for high network fee periods
-}
-
-/// Joint grant configuration for collaborative projects
-#[derive(Clone)]
-#[contracttype]
-pub struct JointGrantConfig {
-    pub primary_recipient: Address,    // Primary grantee address
-    pub secondary_recipient: Address,  // Secondary grantee address
-    pub total_amount: i128,            // Total grant amount
-    pub flow_rate: i128,               // Combined flow rate
-    pub asset: Address,                // Token asset address
-    pub warmup_duration: u64,          // Warmup period
-    pub primary_share_bps: u32,        // Primary recipient's share in basis points (0-10000)
-    pub secondary_share_bps: u32,      // Secondary recipient's share in basis points (0-10000)
-    pub require_dual_signature: bool,  // Whether both signatures are required for withdrawal
-    pub validator: Option<Address>,    // Optional validator address
-    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
-    pub milestone_amount: i128,        // Amount per milestone
-    pub total_milestones: u32,         // Total number of milestones
-    pub gas_buffer: i128,              // Pre-paid XLM buffer for high network fee periods
 }
 
 /// Result of batch grant initialization
@@ -980,6 +879,25 @@ pub struct FlashLoanProvider {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct ReputationScore {
+    pub user: Address,
+    pub total_completions: u32,     // Total educational completions across projects
+    pub average_score: u32,         // Average completion score (0-100)
+    pub last_updated: u64,          // Last time reputation was calculated
+    pub projects_completed: Vec<Address>, // List of project contracts completed
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ExternalContractQuery {
+    pub contract_address: Address,
+    pub query_function: Symbol,     // Function to call (e.g., "get_completion_status")
+    pub project_name: String,       // Human-readable project name
+    pub weight: u32,               // Weight for reputation calculation (1-100)
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub enum GrantError {
     GrantNotFound,
     Unauthorized,
@@ -995,6 +913,49 @@ pub enum GrantError {
     InvalidGrantee,
     InvalidStreamConfig,
     InvalidAccelerationConfig,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ArbitrationEscrow {
+    pub grant_id: u64,
+    pub escrow_amount: i128,
+    pub dispute_raised_by: Address,
+    pub dispute_reason: String,
+    pub dispute_timestamp: u64,
+    pub arbitrator: Address,
+    pub status: ArbitrationStatus,
+    pub resolution: Option<String>,
+    pub resolution_timestamp: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ArbitrationStatus {
+    Pending,      // Awaiting arbitrator assignment
+    Active,       // Under active arbitration
+    Resolved,     // Arbitration completed
+    Cancelled,    // Dispute cancelled
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct GrantBalanceSnapshot {
+    pub grant_id: u64,
+    pub total_amount: i128,
+    pub withdrawn: i128,
+    pub claimable: i128,
+    pub remaining: i128,
+    pub last_updated: u64,
+    pub status: GrantStatus,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct CacheStats {
+    pub cache_enabled: bool,
+    pub cache_ttl_seconds: u32,
+    pub estimated_hit_rate: u32, // Percentage
 }
 
 impl From<GrantError> for soroban_sdk::Error {
@@ -1014,7 +975,12 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
             GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
             GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
-enum DataKey {
+        }
+    }
+}
+
+#[contracttype]
+pub enum DataKey {
     Admin,
     GrantToken,
     GrantIds,
@@ -1083,8 +1049,6 @@ pub enum Error {
     AlreadyInitialized = 2,
     NotAuthorized = 3,
     GrantNotFound = 4,
-    GrantAlreadyExists = 5,
-    InvalidRate = 6,
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
@@ -1093,8 +1057,8 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     WithdrawalLimitExceeded = 200, // Task #193
-}
-
+    TemporalGuardViolation = 201, // Task #183: Flash loan protection
+    
     // Lease-related errors
     InvalidLeaseTerms = 14,
     LeaseAlreadyTerminated = 15,
@@ -1119,39 +1083,6 @@ pub enum Error {
     ParticipationThresholdNotMet = 32,
     ApprovalThresholdNotMet = 33,
     NoStakeToSlash = 34,
-    SlashingAlreadyExecuted = 35,
-    InvalidReasonLength = 36,
-    // Proposal Staking Escrow errors
-    InsufficientStake = 37,
-    StakeAlreadyDeposited = 38,
-    StakeNotDeposited = 39,
-    StakeAlreadyReturned = 40,
-    StakeAlreadyBurned = 41,
-    InvalidStakeAmount = 42,
-    // Sub-DAO Authority errors
-    SubDaoActionNotAllowed = 43,
-    SubDaoPermissionRevoked = 44,
-    SubDaoActionVetoed = 45,
-    SubDaoContractNotSet = 46,
-    // COI (Conflict of Interest) errors
-    VoterHasConflictOfInterest = 47,
-    LinkedAddressAlreadyExists = 48,
-    LinkedAddressNotFound = 49,
-    CannotVoteOnOwnGrant = 50,
-    ExcludedFromVoting = 51,
-    // Milestone system errors
-    MilestoneNotFound = 52,
-    MilestoneAlreadyClaimed = 53,
-    InvalidMilestoneNumber = 54,
-    ChallengeNotFound = 55,
-    ChallengeAlreadyExists = 56,
-    ChallengePeriodExpired = 57,
-    ChallengeNotActive = 58,
-    InvalidChallengeStatus = 59,
-    InsufficientMilestoneFunds = 60,
-    MilestoneNotClaimed = 61,
-    MilestoneAlreadyChallenged = 62,
-    // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
 
@@ -1208,141 +1139,92 @@ fn read_sub_dao_authority_contract(env: &Env) -> Result<Address, Error> {
 fn check_sub_dao_permission(env: &Env, caller: &Address, grant_id: u64, action: &str) -> Result<(), Error> {
     let sub_dao_contract = read_sub_dao_authority_contract(env)?;
     
-    // This would be a contract call to check permissions
-    // For now, we'll implement basic logic here
-    // In production, this would call SubDaoAuthority::validate_sub_dao_action
+    // Unified from main & feat/Grant
+    pub gas_buffer: i128,
+    pub gas_buffer_used: i128,
+    pub max_withdrawal_per_day: i128,
+    pub last_withdrawal_timestamp: u64,
+    pub withdrawal_amount_today: i128,
     
-    // Check if caller manages this grant
-    // Note: In a real implementation, this would query the Sub-DAO authority contract
-    // For now, we'll use a simplified approach
+    // Arbitration Escrow fields
+    pub escrow_amount: i128,
+    pub arbitrator: Option<Address>,
+    pub dispute_reason: Option<String>,
     
-    Err(Error::SubDaoActionNotAllowed) // Default to not allowed until proper integration
+    // Lease fields
+    pub lessor: Address,
+    pub lease_terminated: bool,
+    pub last_resume_timestamp: Option<u64>,
 }
 
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GrantIds)
-        .unwrap_or_else(|| Vec::new(env))
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+    pub gas_buffer: i128,
 }
 
-// Lease Helper Functions
-fn read_lease_agreement(env: &Env, grant_id: u64) -> Result<(Address, String, String, i128, u64), Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::LeaseAgreement(grant_id))
-        .ok_or(Error::GrantNotFound)
-}
+// --- Implementation ---
 
-fn write_lease_agreement(env: &Env, grant_id: u64, lessor: &Address, property_id: &str, serial_number: &str, security_deposit: i128, lease_end_time: u64) {
-    let agreement = (lessor.clone(), String::from_str(env, property_id), String::from_str(env, serial_number), security_deposit, lease_end_time);
-    env.storage().instance().set(&DataKey::LeaseAgreement(grant_id), &agreement);
-}
+#[contract]
+pub struct GrantContract;
 
-fn read_property_history(env: &Env, property_id: &str) -> Vec<(u64, Address, u64)> {
-    env.storage()
-        .instance()
-        .get(&DataKey::PropertyRegistry(String::from_str(env, property_id)))
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-fn write_property_history(env: &Env, property_id: &str, history: &Vec<(u64, Address, u64)>) {
-    env.storage().instance().set(&DataKey::PropertyRegistry(String::from_str(env, property_id)), history);
-}
-
-fn calculate_security_deposit(total_amount: i128, deposit_percentage: i128) -> Result<i128, Error> {
-    if deposit_percentage < MIN_SECURITY_DEPOSIT_PERCENTAGE || deposit_percentage > MAX_SECURITY_DEPOSIT_PERCENTAGE {
-        return Err(Error::InvalidSecurityDeposit);
+#[contractimpl]
+impl GrantContract {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+        oracle: Address,
+        native_token: Address,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        Ok(())
     }
-    
-    let deposit = total_amount
-        .checked_mul(deposit_percentage)
-        .ok_or(Error::MathOverflow)?
-        .checked_div(10000) // Convert from basis points
-        .ok_or(Error::MathOverflow)?;
-    
-    Ok(deposit)
-}
 
-// Financial Snapshot Helper Functions
-fn read_snapshot_nonce(env: &Env, grant_id: u64) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::SnapshotNonce(grant_id))
-        .unwrap_or(0)
-}
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
 
-fn write_snapshot_nonce(env: &Env, grant_id: u64, nonce: u64) {
-    env.storage().instance().set(&DataKey::SnapshotNonce(grant_id), &nonce);
-}
+        // Check 24-hour limit
+        let now = env.ledger().timestamp();
+        if now >= grant.last_withdrawal_timestamp + 86400 {
+            grant.withdrawal_amount_today = 0;
+            grant.last_withdrawal_timestamp = now;
+        }
 
-fn read_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::FinancialSnapshot(grant_id, timestamp))
-        .ok_or(Error::SnapshotNotFound)
-}
+        if grant.withdrawal_amount_today + amount > grant.max_withdrawal_per_day {
+            return Err(Error::WithdrawalLimitExceeded);
+        }
 
-fn write_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64, snapshot: &FinancialSnapshot) {
-    env.storage().instance().set(&DataKey::FinancialSnapshot(grant_id, timestamp), snapshot);
-}
+        // Logic for transfer...
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        grant.withdrawal_amount_today += amount;
 
-fn generate_snapshot_hash(
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-    expiry: u64,
-    version: u32,
-) -> [u8; 32] {
-    // Create a deterministic hash from snapshot data
-    // In a real implementation, this would use SHA-256 or similar
-    let mut hasher = [0u8; 32];
-    
-    // Simple hash implementation for demonstration
-    // In production, use proper cryptographic hash
-    let combined = format!(
-        "{}:{}:{}:{}:{}",
-        grant_id, total_received, timestamp, expiry, version
-    );
-    
-    // For now, return a placeholder hash
-    // TODO: Implement proper SHA-256 hashing
-    for i in 0..32.min(combined.len()) {
-        hasher[i] = combined.as_bytes()[i];
+        let token_client = token::Client::new(&env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
-    
-    hasher
 }
 
-fn generate_contract_signature(
-    env: &Env,
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-) -> [u8; 64] {
-    // Generate a contract signature for the snapshot
-    // In a real implementation, this would use the contract's private key
-    // For now, return a deterministic signature based on the data
-    let mut signature = [0u8; 64];
-    
-    let combined = format!("{}:{}:{}", grant_id, total_received, timestamp);
-    
-    // Simple signature generation for demonstration
-    // In production, use proper cryptographic signing
-    for i in 0..64.min(combined.len()) {
-        signature[i] = combined.as_bytes()[i];
-    }
-    
-    signature
-}
-
-// Slashing Proposal Helper Functions
-fn read_next_proposal_id(env: &Env) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::NextProposalId)
-        .unwrap_or(1)
-}
+// --- Helpers ---
 
 fn write_next_proposal_id(env: &Env, proposal_id: u64) {
     env.storage().instance().set(&DataKey::NextProposalId, &proposal_id);
@@ -1448,6 +1330,71 @@ fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bo
     };
     
     (participation_met, approval_met)
+}
+
+// --- Temporal Guard Helper Functions (Task #183) ---
+
+fn get_temporal_guard_contract(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TemporalGuardContract)
+        .ok_or(Error::NotInitialized)
+}
+
+fn set_temporal_guard_contract(env: &Env, address: &Address) {
+    env.storage().instance().set(&DataKey::TemporalGuardContract, address);
+}
+
+fn check_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if withdrawal is allowed
+    guard_client.check_withdraw_allowed(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful withdrawal
+    guard_client.record_withdrawal(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn check_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if voting is allowed
+    guard_client.check_vote_allowed(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful vote
+    guard_client.record_vote(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
 }
 
 // --- Milestone System Helper Functions ---
@@ -1773,6 +1720,21 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Task #183: Set the Temporal Guard contract address (admin only)
+    /// This enables flash loan protection for voting and withdrawal operations
+    pub fn set_temporal_guard_contract(env: Env, admin: Address, temporal_guard_contract: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::TemporalGuardContract, &temporal_guard_contract);
+        
+        env.events().publish(
+            (symbol_short!("temp_guard_contract_set"),),
+            (admin, temporal_guard_contract),
+        );
+        
+        Ok(())
+    }
+
     /// Task #192: Batch Refund for Failed Grant Rounds
     /// Atomic refund for failed Gitcoin-style rounds. Optimized iterate-and-transfer.
     pub fn batch_refund(env: Env, grant_id: u64) -> Result<(), Error> {
@@ -1783,32 +1745,22 @@ impl GrantContract {
             return Err(Error::InvalidState); 
         }
 
-        let donors: Vec<Address> = env.storage().instance().get(&DataKey::GrantDonors(grant_id)).unwrap_or_else(|| Vec::new(&env));
-        let token_client = token::Client::new(&env, &grant.token_address);
-        let mut total_refunded = 0i128;
-
-        for donor in donors.iter() {
-            let key = DataKey::DonorRecord(grant_id, donor.clone());
-            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            if amount > 0 {
-                token_client.transfer(&env.current_contract_address(), &donor, &amount);
-                env.storage().instance().remove(&key);
-                total_refunded += amount;
-            }
+        if stream_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidStreamConfig);
         }
-        
-        env.storage().instance().remove(&DataKey::GrantDonors(grant_id));
-        
-        env.events().publish(
-            (symbol_short!("bat_ref"), grant_id),
-            (donors.len(), total_refunded),
-        );
-        
-        Ok(())
+
+        grant.stream_start = stream_start;
+        grant.stream_duration = stream_duration;
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
     }
 
     /// Task #193: Grantee Withdrawal Limit Cooldown Logic
     /// Enforces a daily withdrawal cap to prevent unauthorized rapidly draining.
+    /// 
+    /// Enhanced with Task #183: Cross-Contract Flash Loan Protection
+    /// Prevents voting and withdrawal in the same ledger to stop atomic exploits.
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
@@ -1816,6 +1768,9 @@ impl GrantContract {
         if grant.status != GrantStatus::Active {
             return Err(Error::InvalidState);
         }
+
+        // Task #183: Check temporal guard protection before withdrawal
+        check_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         // Settle accruals
         // settle_grant_internal_logic_call(&mut grant, env.ledger().timestamp())?;
@@ -1844,6 +1799,9 @@ impl GrantContract {
         token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
         write_grant(&env, grant_id, &grant);
+
+        // Task #183: Record successful withdrawal in temporal guard
+        record_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         env.events().publish(
             (symbol_short!("withdraw"), grant_id),
@@ -1932,9 +1890,11 @@ impl GrantContract {
         total_amount: i128,
         flow_rate: i128,
         warmup_duration: u64,
-
+        priority_level: u32,
+        security_deposit_percentage: u32,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
         if total_amount <= 0 || flow_rate < 0 {
             return Err(Error::InvalidAmount);
@@ -2027,6 +1987,7 @@ impl GrantContract {
         starting_grant_id: u64,
     ) -> Result<BatchInitResult, Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
         if grantee_configs.is_empty() {
             return Err(Error::InvalidAmount);
@@ -3748,6 +3709,12 @@ pub mod grant {
         let mut grant = read_grant(&env, grant_id)?;
         let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
         validator_addr.require_auth();
+        Self::check_protocol_not_paused(&env);
+
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            return Err(Error::InvalidState);
+        }
 
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
@@ -3767,6 +3734,9 @@ pub mod grant {
             .ok_or(Error::MathOverflow)?;
 
         write_grant(&env, grant_id, &grant);
+
+        // Invalidate balance cache after validator withdrawal
+        Self::invalidate_balance_cache(&env, grant_id);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
@@ -4147,8 +4117,11 @@ pub mod grant {
             return Err(Error::StakeAlreadyDeposited);
         }
 
-        // Validate stake amount
-        if amount != PROPOSAL_STAKE_AMOUNT {
+        // Calculate reputation-based discount
+        let required_amount = calculate_reputation_stake_discount(&env, &staker, PROPOSAL_STAKE_AMOUNT)?;
+
+        // Validate stake amount (must be at least the discounted amount)
+        if amount < required_amount {
             return Err(Error::InvalidStakeAmount);
         }
 
@@ -4179,10 +4152,10 @@ pub mod grant {
         let current_balance = read_stake_escrow_balance(&env);
         write_stake_escrow_balance(&env, current_balance + amount);
 
-        // Publish stake deposit event
+        // Publish stake deposit event with reputation discount info
         env.events().publish(
             (Symbol::new(&env, "proposal_stake_deposited"), grant_id),
-            (staker, amount, now),
+            (staker, amount, required_amount, now),
         );
 
         Ok(())
@@ -5965,6 +5938,8 @@ fn read_tax_withholding_reserve(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::JurisdictionRegistryNotSet)
 }
 
+#[cfg(test)]
+mod test_reputation_scoring;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
