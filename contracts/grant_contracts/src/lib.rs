@@ -70,7 +70,10 @@ const DEX_PRICE_EXPIRY_SECS: u64 = 300; // 5 minutes DEX price expiry
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
-pub mod atomic_bridge;
+pub mod temporal_guard;
+pub mod stream_nft;
+pub mod multi_token_matching;
+pub mod staking_multiplier;
 pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
@@ -830,6 +833,13 @@ enum DataKey {
     // Task #192: Batch refund tracking
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
     GrantDonors(u64),          // List of donors for a grant
+    
+    // Task #189: Conditional Matching Multiplier based on Staking
+    StakingMultiplierContract, // Address of the Staking Multiplier contract
+    VestingVaultContract, // Address of the Vesting Vault contract
+    StakingWeights(Address), // Maps donor to staking weights
+    ProjectTokenSupport(Address), // Maps project token to supported status
+    StakingCache(Address, Address), // Maps donor + project to cached staking info
 }
 
 #[contracterror]
