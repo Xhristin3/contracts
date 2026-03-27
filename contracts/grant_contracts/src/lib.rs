@@ -70,7 +70,8 @@ const DEX_PRICE_EXPIRY_SECS: u64 = 300; // 5 minutes DEX price expiry
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
-pub mod atomic_bridge;
+pub mod temporal_guard;
+pub mod stream_nft;
 pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
@@ -92,6 +93,8 @@ mod test_optimistic_milestones;
 mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
+#[cfg(test)]
+mod test_stream_nft;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -830,6 +833,11 @@ enum DataKey {
     // Task #192: Batch refund tracking
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
     GrantDonors(u64),          // List of donors for a grant
+    
+    // Task #184: Stream NFT Wrapping for Secondary Liquidity
+    StreamNFTContract, // Address of the Stream NFT contract
+    WrappedStreamNFT(u64), // Maps grant_id to NFT token_id
+    StreamNFTBeneficiary(u64), // Maps grant_id to current NFT holder
 }
 
 #[contracterror]
@@ -944,6 +952,14 @@ pub enum Error {
     InsufficientMatchingPool = 74,
     PriceVolatilityExceeded = 75,
     InvalidPriceBuffer = 76,
+    
+    // Task #184: Stream NFT Wrapping errors
+    StreamNFTNotFound = 77,
+    StreamAlreadyWrapped = 78,
+    StreamNotWrapped = 79,
+    InvalidDiscountRate = 80,
+    NFTTransferFailed = 81,
+    StreamExpired = 82,
 }
 
 // --- Internal Helpers ---
