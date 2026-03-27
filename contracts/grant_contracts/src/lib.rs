@@ -953,6 +953,12 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
+<<<<<<< feat/Protocol
+    // Protocol Level Pause keys
+    ProtocolAdmins, // List of 7 admin addresses for 5-of-7 multi-sig
+    ProtocolPauseSignatures, // List of admin addresses that have signed to pause
+    ProtocolPaused, // Boolean indicating if protocol is paused
+=======
     // Gas buffer keys
     GasBuffer(u64), // Maps grant_id to gas buffer balance
     // Joint grant keys
@@ -996,6 +1002,7 @@ enum DataKey {
     FlashLoanProvider,         // Flash loan provider configuration
     NextFlashLoanId,           // Next available flash loan ID
     ActiveFlashLoans,         // Count of active flash loans
+>>>>>>> main
 }
 
 #[contracterror]
@@ -1912,9 +1919,11 @@ impl GrantContract {
         total_amount: i128,
         flow_rate: i128,
         warmup_duration: u64,
-
+        priority_level: u32,
+        security_deposit_percentage: u32,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
         if total_amount <= 0 || flow_rate < 0 {
             return Err(Error::InvalidAmount);
@@ -2007,6 +2016,7 @@ impl GrantContract {
         starting_grant_id: u64,
     ) -> Result<BatchInitResult, Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
         if grantee_configs.is_empty() {
             return Err(Error::InvalidAmount);
@@ -2244,6 +2254,8 @@ impl GrantContract {
             }
         }
 
+        Self::check_protocol_not_paused(&env);
+
         // WASM Hash Verification Hook - Ensure user is interacting with the correct contract version
         let current_wasm_hash = env.current_contract_address().contract_id();
         let verification_result = WasmHashVerification::verify_grant_wasm_hash(
@@ -2309,6 +2321,11 @@ impl GrantContract {
             .set(&DataKey::Grant(grant_id), &grant);
     }
 
+<<<<<<< feat/Protocol
+    pub fn withdraw(env: Env, grant_id: Symbol, caller: Address) -> u128 {
+        caller.require_auth();
+        Self::check_protocol_not_paused(&env);
+=======
     fn finalize_milestone_approval(
         env: &Env,
         grant_id: &Symbol,
@@ -2318,6 +2335,7 @@ impl GrantContract {
     ) {
         milestone.approved = true;
         milestone.approved_at = Some(env.ledger().timestamp());
+>>>>>>> main
 
         // Release milestone funds to grantee
         let token_client = token::Client::new(env, &grant.token_address);
@@ -3728,6 +3746,7 @@ pub mod grant {
         let mut grant = read_grant(&env, grant_id)?;
         let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
         validator_addr.require_auth();
+        Self::check_protocol_not_paused(&env);
 
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
@@ -4550,6 +4569,133 @@ pub mod grant {
             verified,
         ).map_err(|e| Error::Custom(2000 + e as u32))
     }
+<<<<<<< feat/Protocol
+
+    // Protocol Level Pause Functions
+
+    /// Initialize the protocol admins (7-of-7 setup required)
+    pub fn set_protocol_admins(env: Env, caller: Address, admins: Vec<Address>) -> Result<(), Error> {
+        // Only the contract admin can set protocol admins initially
+        require_admin_auth(&env)?;
+
+        if admins.len() != 7 {
+            return Err(Error::InvalidAmount); // Reuse error for invalid count
+        }
+
+        // Check for duplicates
+        for i in 0..admins.len() {
+            for j in (i+1)..admins.len() {
+                if admins.get(i).unwrap() == admins.get(j).unwrap() {
+                    return Err(Error::InvalidAmount);
+                }
+            }
+        }
+
+        env.storage().instance().set(&DataKey::ProtocolAdmins, &admins);
+        env.storage().instance().set(&DataKey::ProtocolPaused, &false);
+        env.storage().instance().set(&DataKey::ProtocolPauseSignatures, &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (symbol_short!("proto_admins_set"),),
+            (caller, admins.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Sign to pause the protocol (requires 5-of-7 signatures)
+    pub fn sign_protocol_pause(env: Env, caller: Address) -> Result<(), Error> {
+        // Check if already paused
+        if Self::is_protocol_paused(&env) {
+            return Err(Error::InvalidState);
+        }
+
+        let admins = env.storage().instance().get::<_, Vec<Address>>(&DataKey::ProtocolAdmins)
+            .ok_or(Error::NotInitialized)?;
+
+        // Verify caller is an admin
+        if !admins.contains(&caller) {
+            return Err(Error::NotAuthorized);
+        }
+
+        let mut signatures = env.storage().instance().get::<_, Vec<Address>>(&DataKey::ProtocolPauseSignatures)
+            .unwrap_or(Vec::new(&env));
+
+        // Check if already signed
+        if signatures.contains(&caller) {
+            return Err(Error::InvalidState); // Already signed
+        }
+
+        // Add signature
+        signatures.push_back(caller.clone());
+        env.storage().instance().set(&DataKey::ProtocolPauseSignatures, &signatures);
+
+        // Check if we have 5 signatures
+        if signatures.len() >= 5 {
+            env.storage().instance().set(&DataKey::ProtocolPaused, &true);
+            env.storage().instance().set(&DataKey::ProtocolPauseSignatures, &Vec::<Address>::new(&env)); // Reset for future pauses
+
+            env.events().publish(
+                (symbol_short!("protocol_paused"),),
+                (caller, signatures.len()),
+            );
+        } else {
+            env.events().publish(
+                (symbol_short!("proto_pause_sig"),),
+                (caller, signatures.len()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Unpause the protocol (any admin can unpause)
+    pub fn unpause_protocol(env: Env, caller: Address) -> Result<(), Error> {
+        let admins = env.storage().instance().get::<_, Vec<Address>>(&DataKey::ProtocolAdmins)
+            .ok_or(Error::NotInitialized)?;
+
+        // Verify caller is an admin
+        if !admins.contains(&caller) {
+            return Err(Error::NotAuthorized);
+        }
+
+        if !Self::is_protocol_paused(&env) {
+            return Err(Error::InvalidState);
+        }
+
+        env.storage().instance().set(&DataKey::ProtocolPaused, &false);
+        env.storage().instance().set(&DataKey::ProtocolPauseSignatures, &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (symbol_short!("protocol_unpaused"),),
+            caller,
+        );
+
+        Ok(())
+    }
+
+    /// Check if protocol is paused
+    pub fn is_protocol_paused(env: &Env) -> bool {
+        env.storage().instance().get::<_, bool>(&DataKey::ProtocolPaused).unwrap_or(false)
+    }
+
+    /// Get protocol pause status and signature count
+    pub fn get_protocol_pause_status(env: Env) -> (bool, u32) {
+        let paused = Self::is_protocol_paused(&env);
+        let signatures = env.storage().instance().get::<_, Vec<Address>>(&DataKey::ProtocolPauseSignatures)
+            .unwrap_or(Vec::new(&env)).len() as u32;
+        (paused, signatures)
+    }
+
+    /// Helper function to check protocol pause and panic if paused
+    fn check_protocol_not_paused(env: &Env) {
+        if Self::is_protocol_paused(env) {
+            panic_with_error!(env, Error::InvalidState);
+        }
+    }
+}
+=======
+>>>>>>> main
 
     // --- Self-Destruct Functions ---
 
