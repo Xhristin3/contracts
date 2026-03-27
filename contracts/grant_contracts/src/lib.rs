@@ -343,6 +343,10 @@ pub enum GrantStatus {
     MilestoneApproved,    // Challenge period passed, funds released
     MilestoneChallenged,  // Milestone challenged, under review
     MilestoneRejected,    // Challenge successful, claim rejected
+    // Arbitration statuses
+    DisputeRaised,       // Dispute raised, funds moved to escrow
+    ArbitrationPending,  // Under arbitration review
+    ArbitrationResolved, // Arbitration completed, funds released
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,6 +402,14 @@ pub struct Grant {
     // Pause cooldown fields
     pub last_resume_timestamp: Option<u64>, // Timestamp when grant was last resumed
     pub pause_count: u32, // Number of times this grant has been paused
+    
+    // Arbitration escrow fields
+    pub dispute_raised_by: Option<Address>, // Address that raised the dispute
+    pub dispute_reason: Option<String>, // Reason for the dispute
+    pub dispute_timestamp: Option<u64>, // When dispute was raised
+    pub arbitrator: Option<Address>, // Assigned arbitrator
+    pub arbitration_resolution: Option<String>, // Arbitration decision
+    pub escrow_amount: i128, // Amount held in arbitration escrow
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -580,6 +592,29 @@ pub enum GrantError {
     InvalidAccelerationConfig,
 }
 
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ArbitrationEscrow {
+    pub grant_id: u64,
+    pub escrow_amount: i128,
+    pub dispute_raised_by: Address,
+    pub dispute_reason: String,
+    pub dispute_timestamp: u64,
+    pub arbitrator: Address,
+    pub status: ArbitrationStatus,
+    pub resolution: Option<String>,
+    pub resolution_timestamp: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ArbitrationStatus {
+    Pending,      // Awaiting arbitrator assignment
+    Active,       // Under active arbitration
+    Resolved,     // Arbitration completed
+    Cancelled,    // Dispute cancelled
+}
+
 impl From<GrantError> for soroban_sdk::Error {
     fn from(error: GrantError) -> Self {
         match error {
@@ -644,6 +679,10 @@ enum DataKey {
     ProtocolAdmins, // List of 7 admin addresses for 5-of-7 multi-sig
     ProtocolPauseSignatures, // List of admin addresses that have signed to pause
     ProtocolPaused, // Boolean indicating if protocol is paused
+    // Arbitration Escrow keys
+    Arbitrators, // List of approved third-party arbitrators
+    ArbitrationEscrow(u64), // Maps grant_id to escrow details
+    NextArbitrationId, // Next available arbitration case ID
 }
 
 #[contracterror]
@@ -1705,6 +1744,11 @@ impl GrantContract {
 
         Self::check_protocol_not_paused(&env);
 
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            return Err(Error::InvalidState);
+        }
+
         // WASM Hash Verification Hook - Ensure user is interacting with the correct contract version
         let current_wasm_hash = env.current_contract_address().contract_id();
         let verification_result = WasmHashVerification::verify_grant_wasm_hash(
@@ -1791,6 +1835,11 @@ impl GrantContract {
         Self::check_protocol_not_paused(&env);
 
         let grant = Self::load_grant(&env, &grant_id);
+
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            panic_with_error!(&env, GrantError::InvalidStatus);
+        }
         let share = match grant.grantees.get(caller.clone()) {
             Some(share) => share,
             None => panic_with_error!(&env, GrantError::InvalidGrantee),
@@ -3151,6 +3200,11 @@ pub mod grant {
         validator_addr.require_auth();
         Self::check_protocol_not_paused(&env);
 
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            return Err(Error::InvalidState);
+        }
+
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
@@ -4094,6 +4148,240 @@ pub mod grant {
         if Self::is_protocol_paused(env) {
             panic_with_error!(env, Error::InvalidState);
         }
+    }
+
+    // Arbitration Escrow Functions
+
+    /// Add an approved arbitrator (admin only)
+    pub fn add_arbitrator(env: Env, caller: Address, arbitrator: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let mut arbitrators = env.storage().instance().get::<_, Vec<Address>>(&DataKey::Arbitrators)
+            .unwrap_or(Vec::new(&env));
+
+        if !arbitrators.contains(&arbitrator) {
+            arbitrators.push_back(arbitrator);
+            env.storage().instance().set(&DataKey::Arbitrators, &arbitrators);
+
+            env.events().publish(
+                (symbol_short!("arbitrator_added"),),
+                (caller, arbitrator),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Remove an arbitrator (admin only)
+    pub fn remove_arbitrator(env: Env, caller: Address, arbitrator: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let mut arbitrators = env.storage().instance().get::<_, Vec<Address>>(&DataKey::Arbitrators)
+            .unwrap_or(Vec::new(&env));
+
+        if let Some(index) = arbitrators.iter().position(|a| a == arbitrator) {
+            arbitrators.remove(index as u32);
+            env.storage().instance().set(&DataKey::Arbitrators, &arbitrators);
+
+            env.events().publish(
+                (symbol_short!("arbitrator_removed"),),
+                (caller, arbitrator),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Raise a dispute and move funds to arbitration escrow
+    pub fn raise_dispute(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+
+        // Only grant admin or recipient can raise dispute
+        if caller != grant.admin && caller != grant.recipient {
+            return Err(Error::NotAuthorized);
+        }
+
+        // Check if grant is in valid state for dispute
+        match grant.status {
+            GrantStatus::Active | GrantStatus::Paused => {},
+            _ => return Err(Error::InvalidState),
+        }
+
+        // Calculate escrow amount (remaining claimable + future entitlements)
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        let escrow_amount = grant.claimable + grant.remaining_balance;
+
+        if escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Update grant status and escrow info
+        grant.status = GrantStatus::DisputeRaised;
+        grant.dispute_raised_by = Some(caller.clone());
+        grant.dispute_reason = Some(reason.clone());
+        grant.dispute_timestamp = Some(env.ledger().timestamp());
+        grant.escrow_amount = escrow_amount;
+
+        // Create arbitration escrow record
+        let arbitration_id = env.storage().instance().get::<_, u64>(&DataKey::NextArbitrationId)
+            .unwrap_or(1);
+
+        let escrow = ArbitrationEscrow {
+            grant_id,
+            escrow_amount,
+            dispute_raised_by: caller.clone(),
+            dispute_reason: reason.clone(),
+            dispute_timestamp: env.ledger().timestamp(),
+            arbitrator: env.storage().instance().get::<_, Vec<Address>>(&DataKey::Arbitrators)
+                .unwrap_or(Vec::new(&env))
+                .get(0).unwrap_or(env.current_contract_address()), // Default to contract if no arbitrators
+            status: ArbitrationStatus::Pending,
+            resolution: None,
+            resolution_timestamp: None,
+        };
+
+        env.storage().instance().set(&DataKey::ArbitrationEscrow(grant_id), &escrow);
+        env.storage().instance().set(&DataKey::NextArbitrationId, &(arbitration_id + 1));
+
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("dispute_raised"), grant_id),
+            (caller, escrow_amount, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Assign arbitrator to a dispute (admin only)
+    pub fn assign_arbitrator(env: Env, caller: Address, grant_id: u64, arbitrator: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let mut escrow = env.storage().instance().get::<_, ArbitrationEscrow>(&DataKey::ArbitrationEscrow(grant_id))
+            .ok_or(Error::GrantNotFound)?;
+
+        // Verify arbitrator is approved
+        let arbitrators = env.storage().instance().get::<_, Vec<Address>>(&DataKey::Arbitrators)
+            .unwrap_or(Vec::new(&env));
+
+        if !arbitrators.contains(&arbitrator) {
+            return Err(Error::NotAuthorized);
+        }
+
+        escrow.arbitrator = arbitrator.clone();
+        escrow.status = ArbitrationStatus::Active;
+
+        env.storage().instance().set(&DataKey::ArbitrationEscrow(grant_id), &escrow);
+
+        env.events().publish(
+            (symbol_short!("arbitrator_assigned"), grant_id),
+            (caller, arbitrator),
+        );
+
+        Ok(())
+    }
+
+    /// Resolve arbitration and release funds (arbitrator only)
+    pub fn resolve_arbitration(
+        env: Env,
+        caller: Address,
+        grant_id: u64,
+        resolution: String,
+        recipient_amount: i128,
+        admin_amount: i128
+    ) -> Result<(), Error> {
+        let mut escrow = env.storage().instance().get::<_, ArbitrationEscrow>(&DataKey::ArbitrationEscrow(grant_id))
+            .ok_or(Error::GrantNotFound)?;
+
+        // Only assigned arbitrator can resolve
+        if caller != escrow.arbitrator {
+            return Err(Error::NotAuthorized);
+        }
+
+        if escrow.status != ArbitrationStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        // Validate amounts
+        if recipient_amount < 0 || admin_amount < 0 || recipient_amount + admin_amount != escrow.escrow_amount {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut grant = read_grant(&env, grant_id)?;
+
+        // Update escrow
+        escrow.status = ArbitrationStatus::Resolved;
+        escrow.resolution = Some(resolution.clone());
+        escrow.resolution_timestamp = Some(env.ledger().timestamp());
+
+        // Update grant
+        grant.status = GrantStatus::ArbitrationResolved;
+        grant.arbitration_resolution = Some(resolution.clone());
+
+        // Release funds
+        let token_addr = read_grant_token(&env)?;
+
+        if recipient_amount > 0 {
+            let client = token::Client::new(&env, &token_addr);
+            client.transfer(&env.current_contract_address(), &grant.recipient, &recipient_amount);
+        }
+
+        if admin_amount > 0 {
+            let client = token::Client::new(&env, &token_addr);
+            client.transfer(&env.current_contract_address(), &grant.admin, &admin_amount);
+        }
+
+        env.storage().instance().set(&DataKey::ArbitrationEscrow(grant_id), &escrow);
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("arbitration_resolved"), grant_id),
+            (caller, recipient_amount, admin_amount, resolution),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel dispute (admin only, before arbitration assigned)
+    pub fn cancel_dispute(env: Env, caller: Address, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let escrow = env.storage().instance().get::<_, ArbitrationEscrow>(&DataKey::ArbitrationEscrow(grant_id))
+            .ok_or(Error::GrantNotFound)?;
+
+        if escrow.status != ArbitrationStatus::Pending {
+            return Err(Error::InvalidState);
+        }
+
+        let mut grant = read_grant(&env, grant_id)?;
+
+        // Restore grant to active state
+        grant.status = GrantStatus::Active;
+        grant.dispute_raised_by = None;
+        grant.dispute_reason = None;
+        grant.dispute_timestamp = None;
+        grant.escrow_amount = 0;
+
+        env.storage().instance().remove(&DataKey::ArbitrationEscrow(grant_id));
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("dispute_cancelled"), grant_id),
+            caller,
+        );
+
+        Ok(())
+    }
+
+    /// Get arbitration escrow details
+    pub fn get_arbitration_escrow(env: Env, grant_id: u64) -> Option<ArbitrationEscrow> {
+        env.storage().instance().get(&DataKey::ArbitrationEscrow(grant_id))
+    }
+
+    /// Get list of approved arbitrators
+    pub fn get_arbitrators(env: Env) -> Vec<Address> {
+        env.storage().instance().get::<_, Vec<Address>>(&DataKey::Arbitrators)
+            .unwrap_or(Vec::new(&env))
     }
 }
 
