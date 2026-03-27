@@ -459,4 +459,64 @@ fn test_protocol_pause() {
     client.withdraw(&grant_id, &grantee);
 }
 
+#[test]
+fn test_arbitration_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Add arbitrator
+    client.add_arbitrator(&admin, &arbitrator);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Let some time pass for streaming
+    set_timestamp(&env, 50);
+
+    // Raise dispute
+    let dispute_reason = String::from_str(&env, "Contract breach");
+    client.raise_dispute(&grantee, &grant_id, &dispute_reason);
+
+    // Check grant status
+    let grant = client.get_grant(&grant_id);
+    assert!(matches!(grant.status, GrantStatus::DisputeRaised));
+
+    // Try to withdraw - should fail
+    let result = client.try_withdraw(&grant_id, &grantee);
+    assert!(result.is_err());
+
+    // Assign arbitrator
+    client.assign_arbitrator(&admin, &grant_id, &arbitrator);
+
+    // Check escrow
+    let escrow = client.get_arbitration_escrow(&grant_id).unwrap();
+    assert_eq!(escrow.arbitrator, arbitrator);
+    assert_eq!(escrow.status, ArbitrationStatus::Active);
+
+    // Resolve arbitration (split funds)
+    let resolution = String::from_str(&env, "Partial breach - 60/40 split");
+    client.resolve_arbitration(&arbitrator, &grant_id, &resolution, &600, &400);
+
+    // Check final grant status
+    let grant = client.get_grant(&grant_id);
+    assert!(matches!(grant.status, GrantStatus::ArbitrationResolved));
+
+    // Check escrow status
+    let escrow = client.get_arbitration_escrow(&grant_id).unwrap();
+    assert_eq!(escrow.status, ArbitrationStatus::Resolved);
+}
+
 }
