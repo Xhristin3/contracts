@@ -11,7 +11,7 @@ optimizer = true
 optimizer_runs = 200
 
 [profile.default.model_checker]
-contracts = { "src/GrantStream.sol" = [ "GrantStream" ] }
+contracts = { "contracts/GrantStream.sol" = [ "GrantStream" ] }
 engine = "chc"
 timeout = 10000
 targets = [ "assert" ]
