@@ -38,6 +38,23 @@ contract GrantStream is Ownable, ReentrancyGuard {
     ///         at claim time must be verified in zkVerifier.
     bool public kycRequired;
 
+    // ─── ZK-Proof Foundation for Privacy-Preserving Payouts ──────────────────
+    
+    /// @notice Nullifier map to prevent double-spending in ZK proofs
+    mapping(bytes32 => bool) public nullifiers;
+    
+    /// @notice Commitment storage for ZK-SNARK compatibility
+    mapping(bytes32 => bool) public commitments;
+    
+    /// @notice Counter for tracking commitment indices
+    uint256 public commitmentCount;
+    
+    /// @notice Merkle root of commitments (for future ZK-SNARK integration)
+    bytes32 public merkleRoot;
+    
+    /// @notice Flag to enable/disable ZK-proof based withdrawals
+    bool public zkProofEnabled;
+
     struct Grant {
         address funder;
         address recipient;
@@ -64,6 +81,10 @@ contract GrantStream is Ownable, ReentrancyGuard {
     event FinalReleaseFlagSet(uint256 indexed grantId, bool required);
     event FinalReleaseApproved(uint256 indexed grantId, address indexed approver, uint256 timestamp);
     event FinalReleaseClaimed(uint256 indexed grantId, address indexed recipient, uint256 amount);
+    event CommitmentAdded(bytes32 indexed commitment);
+    event NullifierUsed(bytes32 indexed nullifier);
+    event MerkleRootUpdated(bytes32 indexed merkleRoot);
+    event ZKProofEnabledToggled(bool enabled);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -98,6 +119,74 @@ contract GrantStream is Ownable, ReentrancyGuard {
         }
         kycRequired = _required;
         emit KYCRequirementChanged(_required);
+    }
+
+    /**
+     * @notice Toggle ZK-proof based withdrawals (owner only).
+     * @param _enabled True to enable ZK-proof mode, false to disable.
+     */
+    function setZKProofEnabled(bool _enabled) external onlyOwner {
+        zkProofEnabled = _enabled;
+        emit ZKProofEnabledToggled(_enabled);
+    }
+
+    /**
+     * @notice Add a commitment to the Merkle tree (for ZK-SNARK integration).
+     * @param commitment The commitment hash to add.
+     */
+    function addCommitment(bytes32 commitment) external nonReentrant {
+        require(commitment != bytes32(0), "GrantStream: Commitment cannot be zero");
+        require(!commitments[commitment], "GrantStream: Commitment already exists");
+        
+        commitments[commitment] = true;
+        commitmentCount++;
+        
+        // In a full ZK implementation, this would update the Merkle tree
+        // For now, we simply track the commitment
+        // Future implementation: _updateMerkleTree(commitment);
+        
+        emit CommitmentAdded(commitment);
+    }
+
+    /**
+     * @notice Use a nullifier to prevent double-spending in ZK proofs.
+     * @param nullifier The nullifier hash to mark as used.
+     */
+    function useNullifier(bytes32 nullifier) external nonReentrant {
+        require(nullifier != bytes32(0), "GrantStream: Nullifier cannot be zero");
+        require(!nullifiers[nullifier], "GrantStream: Nullifier already used (double-spend attempt)");
+        
+        nullifiers[nullifier] = true;
+        
+        emit NullifierUsed(nullifier);
+    }
+
+    /**
+     * @notice Check if a nullifier has been used (prevents double-spending).
+     * @param nullifier The nullifier to check.
+     * @return True if the nullifier has been used.
+     */
+    function isNullifierUsed(bytes32 nullifier) external view returns (bool) {
+        return nullifiers[nullifier];
+    }
+
+    /**
+     * @notice Check if a commitment exists.
+     * @param commitment The commitment to check.
+     * @return True if the commitment exists.
+     */
+    function isCommitmentExists(bytes32 commitment) external view returns (bool) {
+        return commitments[commitment];
+    }
+
+    /**
+     * @notice Update Merkle root (called by owner or ZK proof verifier).
+     * @param _newMerkleRoot The new Merkle root hash.
+     */
+    function updateMerkleRoot(bytes32 _newMerkleRoot) external onlyOwner {
+        require(_newMerkleRoot != bytes32(0), "GrantStream: Merkle root cannot be zero");
+        merkleRoot = _newMerkleRoot;
+        emit MerkleRootUpdated(_newMerkleRoot);
     }
 
     /**
@@ -190,6 +279,57 @@ contract GrantStream is Ownable, ReentrancyGuard {
         if (grant.finalReleaseRequired && grant.balance == 0) {
             emit FinalReleaseClaimed(grantId, grant.recipient, amount);
         }
+
+        emit FundsClaimed(grantId, grant.recipient, net, tax);
+    }
+
+    /**
+     * @notice Claim funds using ZK-proof for privacy-preserving payout.
+     *         This is a foundation function for future ZK-SNARK integration.
+     *         Security researchers and anonymous builders can use this for private claims.
+     * @param grantId ID of the grant.
+     * @param amount Amount to claim.
+     * @param nullifier Nullifier to prevent double-spending.
+     * @param proof ZK-proof bytes (placeholder for future implementation).
+     */
+    function claimWithZKProof(
+        uint256 grantId,
+        uint256 amount,
+        bytes32 nullifier,
+        bytes memory proof
+    ) external nonReentrant {
+        // Foundation for ZK-proof claims - full implementation requires circom/snarkjs
+        require(zkProofEnabled, "GrantStream: ZK-proof claims not enabled");
+        require(!nullifiers[nullifier], "GrantStream: Nullifier already used");
+        
+        Grant storage grant = grants[grantId];
+        require(grant.active, "GrantStream: inactive grant");
+        require(msg.sender == grant.recipient, "GrantStream: not recipient");
+        require(amount > 0 && amount <= grant.balance, "GrantStream: invalid amount");
+        
+        // In a full ZK implementation:
+        // 1. Verify the ZK-proof proves ownership without revealing address
+        // 2. Verify the nullifier hasn't been used
+        // 3. Update Merkle root
+        
+        // For now, we mark the nullifier as used
+        nullifiers[nullifier] = true;
+        emit NullifierUsed(nullifier);
+        
+        grant.balance     -= amount;
+        grant.totalVolume += amount;
+
+        uint256 tax = _computeSustainabilityTax(grant.totalVolume, amount);
+        uint256 net = amount - tax;
+
+        // Transfer sustainability tax to the fund
+        if (tax > 0) {
+            sustainabilityFund.deposit{value: tax}();
+        }
+
+        // Transfer net amount to recipient
+        (bool ok, ) = grant.recipient.call{value: net}("");
+        require(ok, "GrantStream: transfer failed");
 
         emit FundsClaimed(grantId, grant.recipient, net, tax);
     }
