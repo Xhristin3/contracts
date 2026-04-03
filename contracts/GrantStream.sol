@@ -70,28 +70,26 @@ contract GrantStream is Ownable, ReentrancyGuard {
     /**
      * @dev Hot-path status cache packed into ONE storage slot (32 bytes):
      *   recipient  : 20 bytes
-     *   active     :  1 byte   (bool)
-     *   finalReqd  :  1 byte   (bool)
-     *   finalApprv :  1 byte   (bool)
-     *   exists     :  1 byte   (bool)
-     *   endDate    :  5 bytes  (uint40 — enough until year 36,812)
-     *   _pad       :  3 bytes  (unused, keeps slot tight)
+     *   active     :  1 byte
+     *   finalReqd  :  1 byte
+     *   finalApprv :  1 byte
+     *   exists     :  1 byte
+     *   endDate    :  5 bytes  (uint40 — sufficient until year 36,812)
      *
-     * Total: 31 bytes → fits in one 32-byte slot.
      * getStreamStatus() reads ONLY this mapping: 1 SLOAD per call.
      */
     struct StreamStatus {
-        address recipient;   // 20 bytes
-        bool    active;      //  1 byte  } packed by Solidity into the same slot
-        bool    finalReleaseRequired; // 1 byte
-        bool    finalReleaseApproved; // 1 byte
-        bool    exists;      //  1 byte
-        uint40  endDate;     //  5 bytes (covers dates to year 36,812)
+        address recipient;
+        bool    active;
+        bool    finalReleaseRequired;
+        bool    finalReleaseApproved;
+        bool    exists;
+        uint40  endDate;
     }
 
     uint256 public nextGrantId;
     mapping(uint256 => Grant)        public grants;
-    /// @dev Single-slot status cache — updated in sync with `grants` on every write.
+    /// @dev Single-slot status cache — kept in sync with `grants` on every write.
     mapping(uint256 => StreamStatus) public streamStatus;
 
     // ─── Events ───────────────────────────────────────────────────────────────
@@ -271,7 +269,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
             endDate:              uint40(_endDate)
         });
 
-        emit GrantCreated(grantId, msg.sender, recipient, amount);
+        emit GrantCreated(grantId, msg.sender, recipient, msg.value);
         if (_finalReleaseRequired) {
             emit FinalReleaseFlagSet(grantId, true);
         }
@@ -514,10 +512,9 @@ contract GrantStream is Ownable, ReentrancyGuard {
 
     /**
      * @notice Returns the hot-path status of a grant in a single ledger read.
-     *         Costs exactly 1 SLOAD regardless of how many fields are returned,
-     *         because all fields are packed into one 32-byte storage slot.
+     *         All fields are packed into one 32-byte slot, so this costs exactly
+     *         1 SLOAD regardless of how many fields are returned.
      *         Use this instead of getGrantDetails() during high-traffic payday events.
-     * @param grantId Grant to query.
      */
     function getStreamStatus(uint256 grantId)
         external view
@@ -535,10 +532,8 @@ contract GrantStream is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Batch version of getStreamStatus — N grants, N SLOADs.
-     *         Designed for "Payday" events where hundreds of grantees query
-     *         simultaneously; avoids the overhead of N full Grant struct reads.
-     * @param grantIds Array of grant IDs to query.
+     * @notice Batch status query — N grants, N SLOADs.
+     *         For payday events where hundreds of grantees query simultaneously.
      */
     function batchGetStreamStatus(uint256[] calldata grantIds)
         external view
@@ -549,31 +544,5 @@ contract GrantStream is Ownable, ReentrancyGuard {
             statuses[i] = streamStatus[grantIds[i]]; // 1 SLOAD per grant
             unchecked { ++i; }
         }
-    }
-
-    // ─── Wasm-Rotation Hook ───────────────────────────────────────────────────
-
-    /**
-     * @notice Called by GrantStreamProxy.upgradeLogic() to confirm that this
-     *         logic version agrees with the proxy's stored immutable terms for
-     *         a given grant.  Must return true; any mismatch aborts the upgrade.
-     * @param grantId     Grant to verify.
-     * @param funder      Expected funder address (from proxy storage).
-     * @param recipient   Expected recipient address (from proxy storage).
-     * @param totalAmount Expected original deposit (from proxy storage).
-     */
-    function verifyImmutableTerms(
-        uint256 grantId,
-        address funder,
-        address recipient,
-        uint256 totalAmount
-    ) external view returns (bool) {
-        Grant storage g = grants[grantId];
-        if (!g.exists) return false;
-        return g.funder    == funder    &&
-               g.recipient == recipient &&
-               // totalAmount is the original deposit; balance may have changed
-               // so we check against the sum of balance + totalVolume (claimed).
-               (g.balance + g.totalVolume) == totalAmount;
     }
 }
