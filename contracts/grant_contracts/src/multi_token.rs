@@ -59,6 +59,21 @@ pub struct MultiTokenWithdrawResult {
     pub withdrawn_at: u64,
 }
 
+/// Configuration for a wrapped asset
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct WrappedAssetConfig {
+    pub issuer: Address,
+    pub security_buffer: i128, // Minimum balance to maintain for security
+    pub is_halted: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub enum MultiTokenDataKey {
+    WrappedAsset(Address),
+}
+
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
@@ -166,6 +181,14 @@ impl GrantContract {
 
         // Process each withdrawal
         for withdrawal in withdrawals {
+            // Check if asset is halted
+            if let Some(config) = env.storage().instance().get::<_, WrappedAssetConfig>(&MultiTokenDataKey::WrappedAsset(withdrawal.token_address.clone())) {
+                if config.is_halted {
+                    failed_withdrawals.push_back(withdrawal.clone());
+                    continue;
+                }
+            }
+
             match Self::process_token_withdrawal(&mut grant, &withdrawal) {
                 Ok(amount_withdrawn) => {
                     successful_withdrawals.push_back(withdrawal.clone());
@@ -351,6 +374,54 @@ impl GrantContract {
             (token_address, grant.tokens.len()),
         );
 
+        Ok(())
+    }
+
+    /// Configure a wrapped asset with an issuer and security buffer
+    pub fn configure_wrapped_asset(
+        env: Env,
+        token_address: Address,
+        issuer: Address,
+        security_buffer: i128,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let config = WrappedAssetConfig {
+            issuer,
+            security_buffer,
+            is_halted: false,
+        };
+        
+        env.storage().instance().set(&MultiTokenDataKey::WrappedAsset(token_address.clone()), &config);
+        
+        env.events().publish(
+            (symbol_short!("wrap_cfg"), token_address),
+            security_buffer,
+        );
+        
+        Ok(())
+    }
+
+    /// Halt or resume operations for a specific wrapped asset
+    pub fn set_asset_halt(
+        env: Env,
+        token_address: Address,
+        halted: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut config: WrappedAssetConfig = env.storage().instance()
+            .get(&MultiTokenDataKey::WrappedAsset(token_address.clone()))
+            .ok_or(Error::NotInitialized)?;
+            
+        config.is_halted = halted;
+        env.storage().instance().set(&MultiTokenDataKey::WrappedAsset(token_address.clone()), &config);
+        
+        env.events().publish(
+            (symbol_short!("wrap_halt"), token_address),
+            halted,
+        );
+        
         Ok(())
     }
 }

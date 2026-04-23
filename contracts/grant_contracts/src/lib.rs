@@ -1,9 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
-
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal,
+    Symbol, vec, IntoVal, String, Map, xdr::ScVal, xdr::ToXdr, Bytes,
 };
 
 // --- Constants ---
@@ -61,6 +59,12 @@ pub struct Grant {
     pub validator_withdrawn: i128,
     /// Claimable balance accumulator for the validator (5% of stream).
     pub validator_claimable: i128,
+    /// CID (Content Identifier) of the legal document (e.g., SAFT or Grant Agreement).
+    pub legal_hash: Option<String>,
+    /// Flag to prevent funds from streaming until the grantee has cryptographically "signed" the legal document on-chain.
+    pub requires_legal_signature: bool,
+    /// Boolean flag indicating if the legal document has been signed by the grantee.
+    pub is_legal_signed: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +98,7 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     NotValidator = 14,
+    LegalSignatureRequired = 15,
 }
 
 // --- Internal Helpers ---
@@ -213,6 +218,12 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     }
 
     if grant.status == GrantStatus::Active {
+        // Prevent accrual if legal signature is required but not provided
+        if grant.requires_legal_signature && !grant.is_legal_signed {
+            grant.last_update_ts = now;
+            return Ok(());
+        }
+
         // Handle pending rate increases first
         if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
             let switch_ts = grant.effective_timestamp;
@@ -335,9 +346,12 @@ impl GrantContract {
             stream_type: StreamType::FixedAmount,
             start_time: now,
             warmup_duration,
-            validator,
+            validator: validator,
             validator_withdrawn: 0,
             validator_claimable: 0,
+            legal_hash: None,
+            requires_legal_signature: false,
+            is_legal_signed: false,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -363,6 +377,10 @@ impl GrantContract {
         }
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if grant.requires_legal_signature && !grant.is_legal_signed {
+            return Err(Error::LegalSignatureRequired);
+        }
 
         if amount > grant.claimable {
             return Err(Error::InvalidAmount);
@@ -637,8 +655,8 @@ impl GrantContract {
         };
         
         // Integer square root approximation
-        let sqrt_progress_factor = integer_sqrt(progress_factor);
-        let sqrt_factor = integer_sqrt(factor_scaled);
+        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
+        let sqrt_factor = Self::integer_sqrt(factor_scaled);
         
         if sqrt_factor == 0 {
             return 0;
@@ -694,6 +712,8 @@ impl GrantContract {
         }
         
         result
+    }
+
     /// Returns the current claimable balance for the validator (5% share).
     pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
@@ -747,6 +767,70 @@ impl GrantContract {
 
         env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
         Ok(())
+    }
+
+    /// Sets the legal hash and signature requirement for a grant.
+    /// Only the administrator can call this.
+    pub fn set_legal_metadata(
+        env: Env,
+        grant_id: u64,
+        legal_hash: String,
+        requires_signature: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        grant.legal_hash = Some(legal_hash);
+        grant.requires_legal_signature = requires_signature;
+        // Reset signed status if metadata changes significantly? 
+        // For simplicity, we just set the requirements.
+        
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("legalset"), grant_id), requires_signature);
+        Ok(())
+    }
+
+    /// Allows the grantee to cryptographically sign the legal hash on-chain.
+    pub fn sign_legal_metadata(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.legal_hash.is_none() {
+            return Err(Error::InvalidState);
+        }
+
+        grant.is_legal_signed = true;
+        grant.last_update_ts = env.ledger().timestamp(); // Resume streaming from now
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("legalsig"), grant_id), env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Packages the grant's unique ID, total value, and current milestone progress into a compact, verifiable byte-array.
+    /// This is intended for cross-chain bridges to read and trigger actions on other chains.
+    pub fn emit_grant_status(env: Env, grant_id: u64) -> Result<soroban_sdk::Bytes, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        let total_value = grant.total_amount;
+        let progress_accrued = grant.withdrawn + grant.claimable + grant.validator_withdrawn + grant.validator_claimable;
+        
+        // Scale progress to 4 decimal places (basis points)
+        let progress_bps = if total_value > 0 {
+            (progress_accrued * 10000) / total_value
+        } else {
+            0
+        };
+
+        // Package into a compact byte array using XDR
+        let mut data = Bytes::new(&env);
+        data.append(&grant_id.to_xdr(&env));
+        data.append(&total_value.to_xdr(&env));
+        data.append(&progress_bps.to_xdr(&env));
+
+        env.events().publish((symbol_short!("grntstat"), grant_id), data.clone());
+        Ok(data)
     }
 }
 

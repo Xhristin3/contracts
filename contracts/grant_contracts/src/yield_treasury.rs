@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, 
-    token, Token, Vec, Map, TryIntoVal, TryFromVal,
+    token, Token, Vec, Map, TryIntoVal, TryFromVal, symbol,
 };
 
 #[contract]
@@ -19,6 +19,15 @@ pub const YIELD_STATUS_EMERGENCY: u32 = 0b00001000;
 pub const YIELD_STRATEGY_STELLAR_AQUA: u32 = 1;
 pub const YIELD_STRATEGY_STELLAR_USDC: u32 = 2;
 pub const YIELD_STRATEGY_LIQUIDITY_POOL: u32 = 3;
+pub const YIELD_STRATEGY_EXTERNAL_VAULT: u32 = 4;
+
+/// Interface for external Soroban vaults
+pub trait VaultInterface {
+    fn deposit(env: Env, from: Address, amount: i128) -> i128;
+    fn withdraw(env: Env, to: Address, amount: i128) -> i128;
+    fn get_total_value(env: Env) -> i128;
+    fn get_share_price(env: Env) -> i128;
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -41,6 +50,8 @@ pub struct TreasuryConfig {
     pub auto_invest: bool,
     pub yield_strategy: u32,
     pub emergency_withdrawal_enabled: bool,
+    pub max_slippage: u32, // Slippage tolerance in basis points
+    pub external_vault: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -249,6 +260,8 @@ impl YieldTreasuryContract {
             auto_invest: initial_config.auto_invest,
             yield_strategy: initial_config.yield_strategy,
             emergency_withdrawal_enabled: initial_config.emergency_withdrawal_enabled,
+            max_slippage: initial_config.max_slippage,
+            external_vault: initial_config.external_vault,
         };
         write_config(env, &config);
         
@@ -301,17 +314,34 @@ impl YieldTreasuryContract {
         
         // Determine strategy
         let investment_strategy = strategy.unwrap_or(config.yield_strategy);
-        
-        // Validate strategy
         match investment_strategy {
             YIELD_STRATEGY_STELLAR_AQUA
             | YIELD_STRATEGY_STELLAR_USDC
-            | YIELD_STRATEGY_LIQUIDITY_POOL => {},
+            | YIELD_STRATEGY_LIQUIDITY_POOL
+            | YIELD_STRATEGY_EXTERNAL_VAULT => {},
             _ => return Err(YieldError::InvalidStrategy),
         }
-        
-        // Transfer tokens from contract to yield position
-        yield_token.transfer(&env.current_contract_address(), &env.current_contract_address(), &amount);
+
+        if investment_strategy == YIELD_STRATEGY_EXTERNAL_VAULT {
+            let vault_addr = config.external_vault.as_ref().ok_or(YieldError::InvalidStrategy)?;
+            
+            // Approve vault to spend tokens
+            yield_token.approve(&env.current_contract_address(), vault_addr, &amount, &env.ledger().timestamp().saturating_add(3600));
+            
+            // Call external vault deposit
+            let shares_minted: i128 = env.invoke_contract(
+                vault_addr,
+                &symbol!("deposit"),
+                (env.current_contract_address(), amount).into_val(&env),
+            );
+            
+            if shares_minted <= 0 {
+                return Err(YieldError::TokenError);
+            }
+        } else {
+            // Transfer tokens from contract to internal yield tracking (for mock strategies)
+            yield_token.transfer(&env.current_contract_address(), &env.current_contract_address(), &amount);
+        }
         
         // Create yield position
         let now = env.ledger().timestamp();
@@ -596,5 +626,51 @@ impl YieldTreasuryContract {
     /// Check if investment is active
     pub fn is_investment_active(env: Env) -> Result<bool, YieldError> {
         Ok(read_yield_position(&env).is_ok())
+    }
+
+    /// Harvest yield from the current strategy and account for it
+    pub fn harvest_yield(env: Env) -> Result<i128, YieldError> {
+        let mut position = read_yield_position(&env)?;
+        let config = read_config(&env)?;
+        
+        let mut actual_yield = 0_i128;
+        
+        if position.strategy == YIELD_STRATEGY_EXTERNAL_VAULT {
+            let vault_addr = config.external_vault.as_ref().ok_or(YieldError::InvalidStrategy)?;
+            
+            // Get current value from external vault
+            let total_value: i128 = env.invoke_contract(
+                vault_addr,
+                &symbol!("get_total_value"),
+                ().into_val(&env),
+            );
+            
+            if total_value > position.current_value {
+                actual_yield = total_value - position.current_value;
+            }
+            
+            position.current_value = total_value;
+            position.accrued_yield = position.accrued_yield.checked_add(actual_yield).ok_or(YieldError::MathOverflow)?;
+            position.last_yield_update = env.ledger().timestamp();
+        } else {
+            // Internal mock strategies
+            update_yield_position(&env, &mut position)?;
+            actual_yield = calculate_yield_amount(&position, env.ledger().timestamp())?;
+        }
+        
+        write_yield_position(&env, &position);
+        
+        // Update metrics
+        let mut metrics = read_metrics(&env)?;
+        metrics.total_yield_earned = metrics.total_yield_earned.checked_add(actual_yield).ok_or(YieldError::MathOverflow)?;
+        metrics.last_yield_calculation = env.ledger().timestamp();
+        write_metrics(&env, &metrics);
+        
+        env.events().publish(
+            (symbol_short!("harvest"),),
+            (actual_yield, position.current_value),
+        );
+        
+        Ok(actual_yield)
     }
 }
