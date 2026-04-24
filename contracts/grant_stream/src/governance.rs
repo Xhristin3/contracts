@@ -21,6 +21,8 @@ pub enum ProposalStatus {
     Passed,
     Rejected,
     Executed,
+    Optimistic,
+    Challenged,
 }
 
 #[derive(Clone, Debug)]
@@ -35,9 +37,10 @@ pub struct Proposal {
     pub yes_votes: i128,
     pub no_votes: i128,
     pub total_voting_power: i128,
-    pub created_at: u64,
     pub stake_amount: i128,
     pub stake_returned: bool,
+    pub is_optimistic: bool,
+    pub challenge_deadline: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +50,7 @@ pub struct Vote {
     pub proposal_id: u64,
     pub weight: i128,
     pub voting_power: i128,
+    pub conviction: i128,
     pub voted_at: u64,
 }
 
@@ -56,6 +60,7 @@ pub struct VotingPower {
     pub address: Address,
     pub token_balance: i128,
     pub voting_power: i128,
+    pub conviction: i128,
     pub last_updated: u64,
 }
 
@@ -75,6 +80,9 @@ pub enum GovernanceDataKey {
     CouncilMembers,
     StakeToken,
     ProposalStakeAmount,
+    OptimisticLimit,
+    ChallengeBond,
+    ConvictionAlpha, // Basis points (e.g., 9000 = 0.9)
 }
 
 #[contracterror]
@@ -97,6 +105,9 @@ pub enum GovernanceError {
     InsufficientStake = 113,
     StakeAlreadyReturned = 114,
     ProposalNotConcluded = 115,
+    InvalidOptimisticAmount = 116,
+    ChallengeWindowClosed = 117,
+    NotOptimistic = 118,
 }
 
 pub struct GovernanceContract;
@@ -172,8 +183,10 @@ impl GovernanceContract {
         env.storage().instance().set(&GovernanceDataKey::VotingThreshold, &voting_threshold);
         env.storage().instance().set(&GovernanceDataKey::QuorumThreshold, &quorum_threshold);
         env.storage().instance().set(&GovernanceDataKey::ProposalIds, &Vec::<u64>::new(&env));
-        // Initialise council as empty; members are added via set_council_members.
         env.storage().instance().set(&GovernanceDataKey::CouncilMembers, &Vec::<Bytes>::new(&env));
+        env.storage().instance().set(&GovernanceDataKey::OptimisticLimit, &500_i128); // Default $500
+        env.storage().instance().set(&GovernanceDataKey::ChallengeBond, &100_i128); // Default $100
+        env.storage().instance().set(&GovernanceDataKey::ConvictionAlpha, &9000_i128); // 0.9
 
         Ok(())
     }
@@ -278,11 +291,98 @@ impl GovernanceContract {
         env.storage().instance().set(&GovernanceDataKey::ProposalIds, &proposal_ids);
 
         env.events().publish(
-            (symbol_short!("prop_new"), proposal_id),
+            (symbol_short!("prop_new"), proposal_id, proposer.clone()),
             (proposer, voting_deadline),
         );
 
         Ok(proposal_id)
+    }
+
+    pub fn propose_optimistic_grant(
+        env: Env,
+        proposer: Address,
+        title: soroban_sdk::String,
+        description: soroban_sdk::String,
+        amount: i128,
+    ) -> Result<u64, GovernanceError> {
+        proposer.require_auth();
+
+        let limit = env.storage().instance().get::<_, i128>(&GovernanceDataKey::OptimisticLimit).unwrap_or(500);
+        if amount > limit {
+            return Err(GovernanceError::InvalidOptimisticAmount);
+        }
+
+        let stake_token = Self::get_stake_token(&env)?;
+        let stake_amount = Self::get_proposal_stake_amount(&env)?;
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&proposer, &env.current_contract_address(), &stake_amount);
+
+        let now = env.ledger().timestamp();
+        let challenge_deadline = now + (48 * 3600); // 48 hours
+
+        let mut proposal_ids = Self::get_proposal_ids(&env)?;
+        let proposal_id = if proposal_ids.is_empty() { 0 } else { proposal_ids.get(proposal_ids.len() - 1).unwrap() + 1 };
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            description,
+            voting_deadline: challenge_deadline,
+            status: ProposalStatus::Optimistic,
+            yes_votes: 0,
+            no_votes: 0,
+            total_voting_power: 0,
+            created_at: now,
+            stake_amount,
+            stake_returned: false,
+            is_optimistic: true,
+            challenge_deadline,
+        };
+
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+        proposal_ids.push_back(proposal_id);
+        env.storage().instance().set(&GovernanceDataKey::ProposalIds, &proposal_ids);
+
+        env.events().publish(
+            (symbol_short!("opti_new"), proposal_id, proposer),
+            (amount, challenge_deadline),
+        );
+
+        Ok(proposal_id)
+    }
+
+    pub fn challenge_optimistic_grant(
+        env: Env,
+        challenger: Address,
+        proposal_id: u64,
+    ) -> Result<(), GovernanceError> {
+        challenger.require_auth();
+
+        let mut proposal = Self::get_proposal(&env, proposal_id)?;
+        if !proposal.is_optimistic || proposal.status != ProposalStatus::Optimistic {
+            return Err(GovernanceError::NotOptimistic);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= proposal.challenge_deadline {
+            return Err(GovernanceError::ChallengeWindowClosed);
+        }
+
+        let bond = env.storage().instance().get::<_, i128>(&GovernanceDataKey::ChallengeBond).unwrap_or(100);
+        let stake_token = Self::get_stake_token(&env)?;
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&challenger, &env.current_contract_address(), &bond);
+
+        proposal.status = ProposalStatus::Challenged;
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (symbol_short!("opti_chal"), proposal_id, challenger),
+            now,
+        );
+
+        Ok(())
     }
 
     pub fn quadratic_vote(
@@ -308,20 +408,31 @@ impl GovernanceContract {
             return Err(GovernanceError::VotingEnded);
         }
 
-        if env.storage().instance().has(&GovernanceDataKey::Vote(voter.clone(), proposal_id)) {
-            return Err(GovernanceError::AlreadyVoted);
-        }
+        let mut conviction_record = env.storage().instance().get::<_, VotingPower>(&GovernanceDataKey::VotingPower(voter.clone())).unwrap_or(VotingPower {
+            address: voter.clone(),
+            token_balance: 0,
+            voting_power,
+            conviction: 0,
+            last_updated: now,
+        });
 
-        let voting_power = Self::calculate_voting_power(&env, &voter)?;
-        let _vote_weight = weight
-            .checked_mul(voting_power)
-            .ok_or(GovernanceError::MathOverflow)?;
+        // Decay existing conviction: conviction = conviction * alpha / 10000
+        let alpha = env.storage().instance().get::<_, i128>(&GovernanceDataKey::ConvictionAlpha).unwrap_or(9000);
+        let decayed_conviction = conviction_record.conviction.checked_mul(alpha).unwrap_or(0) / 10000;
+        
+        // Add new weight to conviction
+        let current_conviction = decayed_conviction.checked_add(weight).unwrap_or(weight);
+        conviction_record.conviction = current_conviction;
+        conviction_record.last_updated = now;
+        
+        env.storage().instance().set(&GovernanceDataKey::VotingPower(voter.clone()), &conviction_record);
 
         let vote = Vote {
             voter: voter.clone(),
             proposal_id,
             weight,
             voting_power,
+            conviction: current_conviction,
             voted_at: now,
         };
 
@@ -329,12 +440,12 @@ impl GovernanceContract {
             .instance()
             .set(&GovernanceDataKey::Vote(voter.clone(), proposal_id), &vote);
 
-        let quadratic_weight = weight
+        let conviction_weight = current_conviction
             .checked_mul(weight)
             .ok_or(GovernanceError::MathOverflow)?;
 
         proposal.yes_votes = proposal.yes_votes
-            .checked_add(quadratic_weight)
+            .checked_add(conviction_weight)
             .ok_or(GovernanceError::MathOverflow)?;
 
         proposal.total_voting_power = proposal.total_voting_power
@@ -548,51 +659,18 @@ impl GovernanceContract {
     }
 
     fn get_voting_threshold(env: &Env) -> Result<i128, GovernanceError> {
-        env.storage()
-            .instance()
-            .get(&GovernanceDataKey::VotingThreshold)
-            .ok_or(GovernanceError::NotInitialized)
+        env.storage().instance().get(&GovernanceDataKey::VotingThreshold).ok_or(GovernanceError::NotInitialized)
     }
 
     fn get_quorum_threshold(env: &Env) -> Result<i128, GovernanceError> {
-        env.storage()
-            .instance()
-            .get(&GovernanceDataKey::QuorumThreshold)
-            .ok_or(GovernanceError::NotInitialized)
+        env.storage().instance().get(&GovernanceDataKey::QuorumThreshold).ok_or(GovernanceError::NotInitialized)
     }
-}
 
     fn get_stake_token(env: &Env) -> Result<Address, GovernanceError> {
-        env.storage()
-            .instance()
-            .get(&GovernanceDataKey::StakeToken)
-            .ok_or(GovernanceError::NotInitialized)
+        env.storage().instance().get(&GovernanceDataKey::StakeToken).ok_or(GovernanceError::NotInitialized)
     }
 
     fn get_proposal_stake_amount(env: &Env) -> Result<i128, GovernanceError> {
-        env.storage()
-            .instance()
-            .get(&GovernanceDataKey::ProposalStakeAmount)
-            .ok_or(GovernanceError::NotInitialized)
-    }
-
-    // View functions
-    pub fn get_proposal_info(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
-        Self::get_proposal(&env, proposal_id)
-    }
-
-    pub fn get_voter_power(env: Env, voter: Address) -> Result<i128, GovernanceError> {
-        Self::calculate_voting_power(&env, &voter)
-    }
-
-    pub fn get_vote_info(
-        env: Env,
-        voter: Address,
-        proposal_id: u64
-    ) -> Result<Vote, GovernanceError> {
-        env.storage()
-            .instance()
-            .get(&GovernanceDataKey::Vote(voter, proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)
+        env.storage().instance().get(&GovernanceDataKey::ProposalStakeAmount).ok_or(GovernanceError::NotInitialized)
     }
 }

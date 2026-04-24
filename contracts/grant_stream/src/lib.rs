@@ -362,10 +362,17 @@ impl GrantStreamContract {
         ids.push_back(grant_id);
         env.storage().instance().set(&DataKey::GrantIds, &ids);
 
-        let recipient_key = DataKey::RecipientGrants(recipient);
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
         let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
         user_grants.push_back(grant_id);
         env.storage().instance().set(&recipient_key, &user_grants);
+
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("strm_cre"), recipient, admin, grant_token, grant_id),
+            total_amount,
+        );
 
         Ok(())
     }
@@ -398,6 +405,13 @@ impl GrantStreamContract {
         let client = token::Client::new(&env, &token_addr);
         let target = grant.redirect.unwrap_or(grant.recipient.clone());
         client.transfer(&env.current_contract_address(), &target, &amount);
+
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("withdraw"), grant.recipient.clone(), admin, grant_token, grant_id),
+            amount,
+        );
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
@@ -446,7 +460,13 @@ impl GrantStreamContract {
         }
 
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("rateupdt"), grant_id), (old_rate, new_rate));
+        
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("rateupdt"), grant.recipient.clone(), admin, grant_token, grant_id),
+            (old_rate, new_rate),
+        );
         Ok(())
     }
 
@@ -467,7 +487,13 @@ impl GrantStreamContract {
         grant.rate_updated_at = env.ledger().timestamp();
 
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("kpimul"), grant_id), (old_rate, grant.flow_rate, multiplier));
+        
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("kpimul"), grant.recipient.clone(), admin, grant_token, grant_id),
+            (old_rate, grant.flow_rate, multiplier),
+        );
         Ok(())
     }
 
@@ -748,7 +774,11 @@ impl GrantStreamContract {
         let client = token::Client::new(&env, &token_addr);
         client.transfer(&env.current_contract_address(), &validator_addr, &amount);
 
-        env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
+        let admin = read_admin(&env)?;
+        env.events().publish(
+            (symbol_short!("valwdraw"), validator_addr, admin, token_addr, grant_id),
+            amount,
+        );
         Ok(())
     }
 
@@ -763,7 +793,13 @@ impl GrantStreamContract {
         grant.legal_hash = Some(legal_hash);
         grant.requires_legal_signature = requires_signature;
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("legalset"), grant_id), requires_signature);
+        
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("legalset"), grant.recipient.clone(), admin, grant_token, grant_id),
+            requires_signature,
+        );
         Ok(())
     }
 
@@ -774,7 +810,13 @@ impl GrantStreamContract {
         grant.is_legal_signed = true;
         grant.last_update_ts = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("legalsig"), grant_id), env.ledger().timestamp());
+        
+        let admin = read_admin(&env)?;
+        let grant_token = read_grant_token(&env)?;
+        env.events().publish(
+            (symbol_short!("legalsig"), grant.recipient.clone(), admin, grant_token, grant_id),
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 
@@ -790,6 +832,15 @@ impl GrantStreamContract {
         data.append(&progress_bps.to_xdr(&env));
         env.events().publish((symbol_short!("grntstat"), grant_id), data.clone());
         Ok(data)
+    }
+
+    pub fn get_health_factor(env: Env) -> Result<i128, Error> {
+        let liabilities = total_allocated_funds(&env)?;
+        // Call yield_treasury module implementation
+        match yield_treasury::YieldTreasuryContract::calculate_pool_health(env, liabilities) {
+            Ok(hf) => Ok(hf),
+            Err(_) => Err(Error::MathOverflow), // Map to generic error for simplicity
+        }
     }
 }
 
