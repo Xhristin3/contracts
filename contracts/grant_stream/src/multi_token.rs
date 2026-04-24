@@ -136,9 +136,10 @@ impl GrantContract {
         env.storage().instance().set(&key, &multi_token_grant);
 
         // Emit creation event
+        let admin = read_admin(&env)?;
         env.events().publish(
-            (symbol_short!("multi_create"), grant_id),
-            (recipient, multi_token_grant.tokens.len(), now),
+            (symbol_short!("mt_create"), recipient.clone(), admin, grant_id),
+            (multi_token_grant.tokens.len(), now),
         );
         emit_multi_token_snapshot(&env, grant_id, &multi_token_grant);
 
@@ -218,8 +219,9 @@ impl GrantContract {
         };
 
         // Emit withdrawal event
+        let admin = read_admin(&env)?;
         env.events().publish(
-            (symbol_short!("multi_withdraw"), grant_id),
+            (symbol_short!("mt_wdraw"), grant.recipient.clone(), admin, grant_id),
             (
                 result.successful_withdrawals.len(),
                 result.failed_withdrawals.len(),

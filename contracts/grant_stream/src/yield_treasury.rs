@@ -279,7 +279,7 @@ impl YieldTreasuryContract {
         write_reserve_balance(env, 0);
         
         env.events().publish(
-            (symbol_short!("yield_init"),),
+            (symbol_short!("yield_init"), admin.clone(), yield_token_address.clone()),
             (admin, yield_token_address),
         );
         
@@ -376,9 +376,11 @@ impl YieldTreasuryContract {
         metrics.last_yield_calculation = now;
         write_metrics(&env, &metrics);
         
+        let admin = read_admin(&env)?;
+        let yield_token = env.storage().instance().get::<_, Address>(&DataKey::YieldToken).unwrap();
         env.events().publish(
-            (symbol_short!("yield_invest"),),
-            (amount, investment_strategy, apy),
+            (symbol_short!("yield_inv"), admin, yield_token, investment_strategy),
+            (amount, apy),
         );
         
         Ok(())
@@ -478,8 +480,10 @@ impl YieldTreasuryContract {
         metrics.last_yield_calculation = env.ledger().timestamp();
         write_metrics(&env, &metrics);
         
+        let admin = read_admin(&env)?;
+        let yield_token = env.storage().instance().get::<_, Address>(&DataKey::YieldToken).unwrap();
         env.events().publish(
-            (symbol_short!("yield_divest"),),
+            (symbol_short!("yield_div"), admin, yield_token),
             (divest_amount, investment_return, yield_return),
         );
         
@@ -666,11 +670,47 @@ impl YieldTreasuryContract {
         metrics.last_yield_calculation = env.ledger().timestamp();
         write_metrics(&env, &metrics);
         
+        let admin = read_admin(&env)?;
+        let yield_token = env.storage().instance().get::<_, Address>(&DataKey::YieldToken).unwrap();
         env.events().publish(
-            (symbol_short!("harvest"),),
+            (symbol_short!("harvest"), admin, yield_token),
             (actual_yield, position.current_value),
         );
         
         Ok(actual_yield)
+    }
+
+    /// Calculate pool health factor (0.0 to 1.0 represented as 0 to 10000 bps)
+    pub fn calculate_pool_health(env: Env, total_liabilities: i128) -> Result<i128, YieldError> {
+        let reserve = read_reserve_balance(&env)?;
+        let mut total_assets = reserve;
+        
+        if let Ok(mut position) = read_yield_position(&env) {
+            update_yield_position(&env, &mut position)?;
+            total_assets = total_assets.checked_add(position.current_value).ok_or(YieldError::MathOverflow)?;
+        }
+        
+        if total_liabilities <= 0 {
+            return Ok(10000); // 1.0 if no liabilities
+        }
+        
+        // Mock volatility: 10% reduction in asset value for risk calculation
+        let risk_adjusted_assets = total_assets.checked_mul(9000).ok_or(YieldError::MathOverflow)? / 10000;
+        
+        let health_factor = risk_adjusted_assets
+            .checked_mul(10000)
+            .ok_or(YieldError::MathOverflow)?
+            .checked_div(total_liabilities)
+            .ok_or(YieldError::MathOverflow)?;
+            
+        if health_factor < 10000 {
+            let admin = read_admin(&env)?;
+            env.events().publish(
+                (symbol_short!("risk_warn"), admin),
+                (health_factor, total_assets, total_liabilities),
+            );
+        }
+        
+        Ok(health_factor)
     }
 }
