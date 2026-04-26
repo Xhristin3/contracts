@@ -859,3 +859,5 @@ mod test;
 mod test_concurrent_withdraw;
 #[cfg(test)]
 mod test_rounding_fuzz;
+#[cfg(test)]
+mod test_temporal_fuzz;
